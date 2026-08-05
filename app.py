@@ -1,73 +1,85 @@
 import os
+import uvicorn
 import faiss
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+
+from fastapi import FastAPI
+from langserve import add_routes
+
+from pydantic import BaseModel, Field
 
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_core.tools import tool
+from langchain_core.runnables import RunnableLambda
+
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings,
 )
-from langchain.tools import tool
+
 from langchain.agents import create_agent
 
-# ==========================================================
-# FastAPI App
-# ==========================================================
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
+
+
+# ---------------------------------------------------
+# FastAPI
+# ---------------------------------------------------
 
 app = FastAPI(
     title="Internet RAG API",
-    version="1.0"
+    version="1.0",
+    description="LangServe Internet Knowledge Agent"
 )
 
-# ==========================================================
-# API Key
-# ==========================================================
+# ---------------------------------------------------
+# API KEY
+# ---------------------------------------------------
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable not set.")
+if GOOGLE_API_KEY is None:
+    raise ValueError("GOOGLE_API_KEY is missing.")
 
-# ==========================================================
+# ---------------------------------------------------
 # Knowledge Base
-# ==========================================================
+# ---------------------------------------------------
 
 big_paragraph = """
-The Internet is a global system of interconnected computer networks that uses the Internet protocol suite (TCP/IP) to communicate between networks and devices.
+The Internet is a global system of interconnected computer networks that uses TCP/IP.
 
-The origins of the Internet date back to the development of packet switching and research commissioned by the United States Department of Defense in the 1960s.
+The origins of the Internet date back to packet switching research in the 1960s.
 
-The primary precursor network was the ARPANET.
+ARPANET was the primary precursor network.
 
-The commercialization of the Internet in the mid-1990s marked a turning point in its expansion.
+The commercialization of the Internet happened during the 1990s.
 
-Today the Internet supports cloud computing, online gaming, social media, video conferencing, e-commerce, education and healthcare.
+Today the Internet powers cloud computing, education,
+e-commerce, healthcare, communication and social media.
 """
 
 documents = [Document(page_content=big_paragraph)]
 
-# ==========================================================
+# ---------------------------------------------------
 # Split Documents
-# ==========================================================
+# ---------------------------------------------------
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
-    chunk_overlap=50,
+    chunk_overlap=50
 )
 
 chunks = splitter.split_documents(documents)
 
-# ==========================================================
+# ---------------------------------------------------
 # Embeddings
-# ==========================================================
+# ---------------------------------------------------
 
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-001",
-    google_api_key=GOOGLE_API_KEY,
+    google_api_key=GOOGLE_API_KEY
 )
 
 dimension = len(embeddings.embed_query("hello"))
@@ -78,99 +90,110 @@ vector_store = FAISS(
     embedding_function=embeddings,
     index=index,
     docstore=InMemoryDocstore(),
-    index_to_docstore_id={},
+    index_to_docstore_id={}
 )
 
 vector_store.add_documents(chunks)
 
-# ==========================================================
-# LLM
-# ==========================================================
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=GOOGLE_API_KEY,
-)
-
-# ==========================================================
+# ---------------------------------------------------
 # Tool
-# ==========================================================
+# ---------------------------------------------------
 
-@tool(response_format="content_and_artifact")
-def retrieve_internet_context(query: str):
-    """Retrieve internet information."""
+@tool
+def retrieve_internet_context(query: str) -> str:
+    """Retrieve Internet information from the knowledge base."""
 
     docs = vector_store.similarity_search(query, k=2)
 
-    text = "\n\n".join(
-        f"{doc.page_content}"
-        for doc in docs
-    )
+    return "\n\n".join(doc.page_content for doc in docs)
 
-    return text, docs
-
-# ==========================================================
+# ---------------------------------------------------
 # Agent
-# ==========================================================
+# ---------------------------------------------------
+
+llm = ChatGoogleGenerativeAI(
+    model="gemma-4-31b-it",
+    api_key=GOOGLE_API_KEY,
+    temperature=0
+)
 
 agent = create_agent(
     model=llm,
     tools=[retrieve_internet_context],
     system_prompt=(
         "You answer only using the retrieved context. "
-        "If the answer is not available, say 'I don't know.'"
-    ),
+        "If the answer is unavailable, say "
+        "'I don't know based on the provided knowledge base.'"
+    )
 )
 
-# ==========================================================
-# Request Model
-# ==========================================================
+# ---------------------------------------------------
+# LangServe
+# ---------------------------------------------------
 
-class Query(BaseModel):
-    question: str
+class AgentInput(BaseModel):
+    input: str = Field(description="Ask a question")
 
-# ==========================================================
-# API Endpoint
-# ==========================================================
+def format_for_agent(x):
+    user_input = x["input"] if isinstance(x, dict) else x.input
+    return {
+        "messages": [
+            ("user", user_input)
+        ]
+    }
 
-@app.get("/")
-def home():
-    return {"message": "Internet RAG API Running"}
+def extract_text_response(agent_output):
 
-@app.post("/chat")
-def chat(query: Query):
+    if not isinstance(agent_output, dict):
+        return str(agent_output)
 
-    try:
+    messages = agent_output.get("messages")
 
-        result = ""
+    if messages is None:
 
-        for event in agent.stream(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": query.question
-                    }
-                ]
-            },
-            stream_mode="values",
-        ):
+        for value in agent_output.values():
 
-            msg = event["messages"][-1]
+            if isinstance(value, dict) and "messages" in value:
 
-            if isinstance(msg.content, list):
+                messages = value["messages"]
+                break
 
-                for block in msg.content:
+    if messages:
 
-                    if block.get("type") == "text":
-                        result += block.get("text", "")
+        last = messages[-1]
+        return getattr(last, "content", str(last))
 
-            else:
-                result += str(msg.content)
+    return str(agent_output)
 
-        return {
-            "response": result
-        }
+formatted_agent_chain = (
+    RunnableLambda(format_for_agent)
+    | agent
+    | RunnableLambda(extract_text_response)
+).with_types(
+    input_type=AgentInput,
+    output_type=str
+)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ---------------------------------------------------
+# Route
+# ---------------------------------------------------
+
+add_routes(
+    app,
+    formatted_agent_chain,
+    path="/agent"
+)
+
+# ---------------------------------------------------
+# Run
+# ---------------------------------------------------
+
+if __name__ == "__main__":
+
+    port = int(os.environ.get("PORT", 8000))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
