@@ -4,10 +4,8 @@ import faiss
 
 from fastapi import FastAPI
 from langserve import add_routes
-
 from pydantic import BaseModel, Field
 
-from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
 
@@ -20,20 +18,19 @@ from langchain.agents import create_agent
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from langchain_community.vectorstores import FAIzzSS
+from langchain_community.vectorstores import FAISS
 from langchain_community.docstore.in_memory import InMemoryDocstore
-
 from langchain_community.document_loaders import PyPDFLoader
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
-    title="PDF RAG Agent API",
+    title="KT RAG Agent API",
     version="1.0",
-    description="RAG Agent using PDF Parsing and Google Gemini"
+    description="RAG Agent for Knowledge Transfer using PDF Parsing",
 )
 
 
@@ -43,43 +40,40 @@ app = FastAPI(
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-if GOOGLE_API_KEY is None:
+if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY is missing.")
 
 
 # ============================================================
-# PDF PATH
+# KT PDF PATH
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PDF_PATH = os.path.join(
     BASE_DIR,
-    "your_document.pdf"
+    "KT_Document.pdf"
 )
 
 if not os.path.exists(PDF_PATH):
     raise FileNotFoundError(
-        f"PDF file not found: {PDF_PATH}"
-    )
-
-if not os.path.exists(PDF_PATH):
-    raise FileNotFoundError(
-        f"PDF file not found: {PDF_PATH}"
+        f"KT_Document.pdf not found at: {PDF_PATH}"
     )
 
 
 # ============================================================
-# LOAD PDF
+# LOAD KT PDF
 # ============================================================
 
-print("Loading PDF...")
+print("========================================")
+print("Loading Knowledge Transfer PDF...")
+print("========================================")
 
 loader = PyPDFLoader(PDF_PATH)
 
 documents = loader.load()
 
-print(f"PDF loaded successfully.")
+print("KT PDF loaded successfully.")
 print(f"Number of pages: {len(documents)}")
 
 
@@ -89,7 +83,7 @@ print(f"Number of pages: {len(documents)}")
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
-    chunk_overlap=150
+    chunk_overlap=150,
 )
 
 chunks = splitter.split_documents(documents)
@@ -98,61 +92,69 @@ print(f"Number of chunks: {len(chunks)}")
 
 
 # ============================================================
-# EMBEDDINGS
+# GOOGLE GEMINI EMBEDDINGS
 # ============================================================
+
+print("Creating Gemini embeddings...")
 
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-001",
-    google_api_key=GOOGLE_API_KEY
+    google_api_key=GOOGLE_API_KEY,
 )
 
 
 # ============================================================
-# CREATE FAISS INDEX
+# CREATE FAISS VECTOR INDEX
 # ============================================================
 
+print("Creating FAISS vector database...")
+
 dimension = len(
-    embeddings.embed_query("test query")
+    embeddings.embed_query(
+        "Knowledge Transfer test query"
+    )
 )
 
 index = faiss.IndexFlatL2(dimension)
-
 
 vector_store = FAISS(
     embedding_function=embeddings,
     index=index,
     docstore=InMemoryDocstore(),
-    index_to_docstore_id={}
+    index_to_docstore_id={},
 )
 
 
 # ============================================================
-# ADD PDF CHUNKS TO VECTOR STORE
+# STORE KT DOCUMENT CHUNKS
 # ============================================================
 
 vector_store.add_documents(chunks)
 
-print("PDF embeddings stored in FAISS.")
+print("KT document embeddings stored successfully.")
 
 
 # ============================================================
-# RAG RETRIEVAL TOOL
+# KT RETRIEVAL TOOL
 # ============================================================
 
 @tool
-def retrieve_pdf_context(query: str) -> str:
+def retrieve_kt_context(query: str) -> str:
     """
-    Retrieve relevant information from the uploaded PDF.
-    Use this tool whenever answering questions about the PDF.
+    Retrieve relevant information from the Knowledge
+    Transfer PDF document.
     """
 
     docs = vector_store.similarity_search(
         query,
-        k=4
+        k=4,
     )
 
     if not docs:
-        return "No relevant information was found in the PDF."
+        return (
+            "No relevant information was found "
+            "in the provided KT document."
+        )
 
     results = []
 
@@ -163,8 +165,11 @@ def retrieve_pdf_context(query: str) -> str:
             "unknown"
         )
 
+        if isinstance(page_number, int):
+            page_number = page_number + 1
+
         results.append(
-            f"Page {page_number + 1 if isinstance(page_number, int) else page_number}:\n"
+            f"Page {page_number}:\n"
             f"{doc.page_content}"
         )
 
@@ -172,49 +177,77 @@ def retrieve_pdf_context(query: str) -> str:
 
 
 # ============================================================
-# LLM
+# GOOGLE GEMINI LLM
 # ============================================================
 
+print("Initializing Gemini LLM...")
+
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
-    api_key=GOOGLE_API_KEY,
-    temperature=0
+    model="gemini-3.5-flash",
+    google_api_key=GOOGLE_API_KEY,
+    temperature=0,
 )
 
 
 # ============================================================
-# RAG AGENT
+# KNOWLEDGE TRANSFER RAG AGENT
 # ============================================================
 
 agent = create_agent(
     model=llm,
-    tools=[retrieve_pdf_context],
+    tools=[retrieve_kt_context],
 
     system_prompt="""
-You are a PDF-based RAG Agent.
+You are an AI Knowledge Transfer (KT) Assistant.
 
-Your job is to answer questions using ONLY information
-retrieved from the provided PDF.
+Your purpose is to help users understand the project
+information contained in the provided KT PDF.
 
-Rules:
+IMPORTANT RULES:
 
-1. Always use the retrieve_pdf_context tool when the
-   user asks a question about the PDF.
+1. Always use the retrieve_kt_context tool when the
+   user asks a question related to the KT document.
 
-2. Do not use outside knowledge.
+2. Use ONLY information retrieved from the KT document.
 
-3. Do not invent information.
+3. Do NOT use outside knowledge.
 
-4. If the requested information is not present in
-   the PDF, respond exactly:
+4. Do NOT invent, guess, or assume information.
 
-   "I don't know based on the provided PDF."
+5. If the answer is not available in the KT document,
+   respond exactly:
 
-5. Give clear and concise answers.
+"I don't know based on the provided KT document."
 
-6. When possible, mention the page number where
-   the information was found.
-"""
+6. Give clear and concise answers.
+
+7. Explain technical information in simple language
+   when possible.
+
+8. Mention the source PDF page number whenever possible.
+
+9. The document may contain information about:
+   - Project overview
+   - Project objectives
+   - Technology stack
+   - System architecture
+   - PDF processing
+   - Text chunking
+   - Embeddings
+   - FAISS vector database
+   - RAG workflow
+   - API endpoints
+   - Setup and installation
+   - Configuration
+   - Deployment
+   - Troubleshooting
+   - Security
+   - Testing
+   - FAQs
+
+10. Always retrieve relevant KT information before
+    generating the final answer.
+""",
 )
 
 
@@ -225,30 +258,33 @@ Rules:
 class AgentInput(BaseModel):
 
     input: str = Field(
-        description="Ask a question about the PDF"
+        description="Ask a question about the KT document"
     )
 
 
 # ============================================================
-# FORMAT INPUT FOR AGENT
+# FORMAT USER INPUT
 # ============================================================
 
-def format_for_agent(x):
+def format_for_agent(data):
 
-    if isinstance(x, dict):
-        user_input = x["input"]
+    if isinstance(data, dict):
+        user_question = data["input"]
     else:
-        user_input = x.input
+        user_question = data.input
 
     return {
         "messages": [
-            ("user", user_input)
+            {
+                "role": "user",
+                "content": user_question,
+            }
         ]
     }
 
 
 # ============================================================
-# EXTRACT AGENT RESPONSE
+# EXTRACT FINAL AGENT RESPONSE
 # ============================================================
 
 def extract_text_response(agent_output):
@@ -265,22 +301,34 @@ def extract_text_response(agent_output):
             if isinstance(value, dict):
 
                 if "messages" in value:
-
                     messages = value["messages"]
                     break
 
-    if messages:
+    if not messages:
+        return str(agent_output)
 
-        last = messages[-1]
+    # Find final AI response
+    for message in reversed(messages):
 
-        content = getattr(
-            last,
-            "content",
-            str(last)
+        message_type = getattr(
+            message,
+            "type",
+            ""
         )
 
-        # Gemini messages can sometimes return
-        # structured content
+        # Skip tool output
+        if message_type == "tool":
+            continue
+
+        content = getattr(
+            message,
+            "content",
+            None
+        )
+
+        if content is None:
+            continue
+
         if isinstance(content, list):
 
             text_parts = []
@@ -299,7 +347,8 @@ def extract_text_response(agent_output):
                         str(item)
                     )
 
-            return "\n".join(text_parts)
+            if text_parts:
+                return "\n".join(text_parts)
 
         return str(content)
 
@@ -316,36 +365,38 @@ formatted_agent_chain = (
     | RunnableLambda(extract_text_response)
 ).with_types(
     input_type=AgentInput,
-    output_type=str
+    output_type=str,
 )
 
 
 # ============================================================
-# LANGSERVE ROUTE
+# LANGSERVE API ROUTE
 # ============================================================
 
 add_routes(
     app,
     formatted_agent_chain,
-    path="/agent"
+    path="/agent",
 )
 
 
 # ============================================================
-# ROOT ROUTE
+# HOME / HEALTH CHECK
 # ============================================================
 
 @app.get("/")
 def home():
 
     return {
-        "message": "PDF RAG Agent is running",
-        "endpoint": "/agent/invoke"
+        "project": "RAG Agent for KT using PDF Parsing",
+        "status": "running",
+        "message": "Knowledge Transfer RAG Agent is running successfully.",
+        "endpoint": "/agent/invoke",
     }
 
 
 # ============================================================
-# RUN SERVER
+# RUN APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
@@ -360,5 +411,5 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port
+        port=port,
     )
