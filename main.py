@@ -23,68 +23,91 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.docstore.in_memory import InMemoryDocstore
 
+from langchain_community.document_loaders import PyPDFLoader
 
-# ---------------------------------------------------
-# FastAPI
-# ---------------------------------------------------
+
+# ============================================================
+# FASTAPI
+# ============================================================
 
 app = FastAPI(
-    title="Internet RAG API",
+    title="PDF RAG Agent API",
     version="1.0",
-    description="LangServe Internet Knowledge Agent"
+    description="RAG Agent using PDF Parsing and Google Gemini"
 )
 
-# ---------------------------------------------------
-# API KEY
-# ---------------------------------------------------
+
+# ============================================================
+# GOOGLE API KEY
+# ============================================================
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if GOOGLE_API_KEY is None:
     raise ValueError("GOOGLE_API_KEY is missing.")
 
-# ---------------------------------------------------
-# Knowledge Base
-# ---------------------------------------------------
 
-big_paragraph = """
-The Internet is a global system of interconnected computer networks that uses TCP/IP.
+# ============================================================
+# PDF PATH
+# ============================================================
 
-The origins of the Internet date back to packet switching research in the 1960s.
+PDF_PATH = "/content/your_document.pdf"
 
-ARPANET was the primary precursor network.
 
-The commercialization of the Internet happened during the 1990s.
+if not os.path.exists(PDF_PATH):
+    raise FileNotFoundError(
+        f"PDF file not found: {PDF_PATH}"
+    )
 
-Today the Internet powers cloud computing, education,
-e-commerce, healthcare, communication and social media.
-"""
 
-documents = [Document(page_content=big_paragraph)]
+# ============================================================
+# LOAD PDF
+# ============================================================
 
-# ---------------------------------------------------
-# Split Documents
-# ---------------------------------------------------
+print("Loading PDF...")
+
+loader = PyPDFLoader(PDF_PATH)
+
+documents = loader.load()
+
+print(f"PDF loaded successfully.")
+print(f"Number of pages: {len(documents)}")
+
+
+# ============================================================
+# SPLIT PDF INTO CHUNKS
+# ============================================================
 
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
+    chunk_size=1000,
+    chunk_overlap=150
 )
 
 chunks = splitter.split_documents(documents)
 
-# ---------------------------------------------------
-# Embeddings
-# ---------------------------------------------------
+print(f"Number of chunks: {len(chunks)}")
+
+
+# ============================================================
+# EMBEDDINGS
+# ============================================================
 
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-001",
     google_api_key=GOOGLE_API_KEY
 )
 
-dimension = len(embeddings.embed_query("hello"))
+
+# ============================================================
+# CREATE FAISS INDEX
+# ============================================================
+
+dimension = len(
+    embeddings.embed_query("test query")
+)
 
 index = faiss.IndexFlatL2(dimension)
+
 
 vector_store = FAISS(
     embedding_function=embeddings,
@@ -93,23 +116,55 @@ vector_store = FAISS(
     index_to_docstore_id={}
 )
 
+
+# ============================================================
+# ADD PDF CHUNKS TO VECTOR STORE
+# ============================================================
+
 vector_store.add_documents(chunks)
 
-# ---------------------------------------------------
-# Tool
-# ---------------------------------------------------
+print("PDF embeddings stored in FAISS.")
+
+
+# ============================================================
+# RAG RETRIEVAL TOOL
+# ============================================================
 
 @tool
-def retrieve_internet_context(query: str) -> str:
-    """Retrieve Internet information from the knowledge base."""
+def retrieve_pdf_context(query: str) -> str:
+    """
+    Retrieve relevant information from the uploaded PDF.
+    Use this tool whenever answering questions about the PDF.
+    """
 
-    docs = vector_store.similarity_search(query, k=2)
+    docs = vector_store.similarity_search(
+        query,
+        k=4
+    )
 
-    return "\n\n".join(doc.page_content for doc in docs)
+    if not docs:
+        return "No relevant information was found in the PDF."
 
-# ---------------------------------------------------
-# Agent
-# ---------------------------------------------------
+    results = []
+
+    for doc in docs:
+
+        page_number = doc.metadata.get(
+            "page",
+            "unknown"
+        )
+
+        results.append(
+            f"Page {page_number + 1 if isinstance(page_number, int) else page_number}:\n"
+            f"{doc.page_content}"
+        )
+
+    return "\n\n".join(results)
+
+
+# ============================================================
+# LLM
+# ============================================================
 
 llm = ChatGoogleGenerativeAI(
     model="gemma-4-31b-it",
@@ -117,30 +172,75 @@ llm = ChatGoogleGenerativeAI(
     temperature=0
 )
 
+
+# ============================================================
+# RAG AGENT
+# ============================================================
+
 agent = create_agent(
     model=llm,
-    tools=[retrieve_internet_context],
-    system_prompt=(
-        "You answer only using the retrieved context. "
-        "If the answer is unavailable, say "
-        "'I don't know based on the provided knowledge base.'"
-    )
+    tools=[retrieve_pdf_context],
+
+    system_prompt="""
+You are a PDF-based RAG Agent.
+
+Your job is to answer questions using ONLY information
+retrieved from the provided PDF.
+
+Rules:
+
+1. Always use the retrieve_pdf_context tool when the
+   user asks a question about the PDF.
+
+2. Do not use outside knowledge.
+
+3. Do not invent information.
+
+4. If the requested information is not present in
+   the PDF, respond exactly:
+
+   "I don't know based on the provided PDF."
+
+5. Give clear and concise answers.
+
+6. When possible, mention the page number where
+   the information was found.
+"""
 )
 
-# ---------------------------------------------------
-# LangServe
-# ---------------------------------------------------
+
+# ============================================================
+# INPUT MODEL
+# ============================================================
 
 class AgentInput(BaseModel):
-    input: str = Field(description="Ask a question")
+
+    input: str = Field(
+        description="Ask a question about the PDF"
+    )
+
+
+# ============================================================
+# FORMAT INPUT FOR AGENT
+# ============================================================
 
 def format_for_agent(x):
-    user_input = x["input"] if isinstance(x, dict) else x.input
+
+    if isinstance(x, dict):
+        user_input = x["input"]
+    else:
+        user_input = x.input
+
     return {
         "messages": [
             ("user", user_input)
         ]
     }
+
+
+# ============================================================
+# EXTRACT AGENT RESPONSE
+# ============================================================
 
 def extract_text_response(agent_output):
 
@@ -153,17 +253,53 @@ def extract_text_response(agent_output):
 
         for value in agent_output.values():
 
-            if isinstance(value, dict) and "messages" in value:
+            if isinstance(value, dict):
 
-                messages = value["messages"]
-                break
+                if "messages" in value:
+
+                    messages = value["messages"]
+                    break
 
     if messages:
 
         last = messages[-1]
-        return getattr(last, "content", str(last))
+
+        content = getattr(
+            last,
+            "content",
+            str(last)
+        )
+
+        # Gemini messages can sometimes return
+        # structured content
+        if isinstance(content, list):
+
+            text_parts = []
+
+            for item in content:
+
+                if isinstance(item, dict):
+
+                    if "text" in item:
+                        text_parts.append(
+                            item["text"]
+                        )
+
+                else:
+                    text_parts.append(
+                        str(item)
+                    )
+
+            return "\n".join(text_parts)
+
+        return str(content)
 
     return str(agent_output)
+
+
+# ============================================================
+# CREATE RAG CHAIN
+# ============================================================
 
 formatted_agent_chain = (
     RunnableLambda(format_for_agent)
@@ -174,9 +310,10 @@ formatted_agent_chain = (
     output_type=str
 )
 
-# ---------------------------------------------------
-# Route
-# ---------------------------------------------------
+
+# ============================================================
+# LANGSERVE ROUTE
+# ============================================================
 
 add_routes(
     app,
@@ -184,13 +321,32 @@ add_routes(
     path="/agent"
 )
 
-# ---------------------------------------------------
-# Run
-# ---------------------------------------------------
+
+# ============================================================
+# ROOT ROUTE
+# ============================================================
+
+@app.get("/")
+def home():
+
+    return {
+        "message": "PDF RAG Agent is running",
+        "endpoint": "/agent/invoke"
+    }
+
+
+# ============================================================
+# RUN SERVER
+# ============================================================
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 8000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            8000
+        )
+    )
 
     uvicorn.run(
         app,
