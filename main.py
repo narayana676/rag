@@ -51,8 +51,17 @@ if GOOGLE_API_KEY is None:
 # PDF PATH
 # ============================================================
 
-PDF_PATH = "/content/your_document.pdf"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+PDF_PATH = os.path.join(
+    BASE_DIR,
+    "your_document.pdf"
+)
+
+if not os.path.exists(PDF_PATH):
+    raise FileNotFoundError(
+        f"PDF file not found: {PDF_PATH}"
+    )
 
 if not os.path.exists(PDF_PATH):
     raise FileNotFoundError(
